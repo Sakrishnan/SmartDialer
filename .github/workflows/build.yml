@@ -336,6 +336,10 @@ jobs:
               private var attemptNo = 1
               private var waitSeconds = 10          // pause between redial attempts (set from the app)
               private var simHandle: PhoneAccountHandle? = null   // SIM used by the first call, reused for redials
+              private var list: List<Client> = emptyList()         // the whole customer list, for auto-dial of the next one
+              private var idx = -1                                  // position of the current customer in the list
+              private var autoNext = false                          // dial the next customer automatically
+              private var minimized = false                         // banner shows only the name when true
           
               override fun onBind(i: Intent?): IBinder? = null
           
@@ -349,6 +353,10 @@ jobs:
                   client = c
                   total = i.getIntExtra("attempts", 1).coerceAtLeast(1)
                   waitSeconds = i.getIntExtra("wait", 10).coerceIn(3, 300)
+                  autoNext = i.getBooleanExtra("auto", false)
+                  minimized = false
+                  list = Store.load(this)
+                  idx = list.indexOfFirst { it.phone == c.phone }
                   attemptNo = 1
                   sawOffhook = false
                   simHandle = null
@@ -369,27 +377,49 @@ jobs:
                       text = s; textSize = size; setTextColor(Color.WHITE)
                       if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
                   }
-                  box.addView(tv(c.name, 24f, true))
-                  box.addView(tv(c.phone, 18f))
+                  // header: name + minimize / maximize button (always visible)
+                  val header = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  header.addView(tv(c.name, 24f, true).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  })
+                  val toggle = Button(this)
+                  header.addView(toggle)
+                  box.addView(header)
+          
+                  // details: hidden when minimized
+                  val details = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  details.addView(tv(c.phone, 18f))
                   val delayRow = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
                   }
                   delayRow.addView(tv("${c.delayedDays}", 72f, true))
                   delayRow.addView(tv("  days delayed", 20f, true))
-                  box.addView(delayRow)
-                  box.addView(tv("Loan day (meeting day): ${c.meetingDay}", 16f))
-                  box.addView(tv("NACH: ${c.nach}", 16f))
-                  box.addView(tv("Last paid on: ${c.lastPaid}", 16f))
-                  if (total > 1) {
-                      val st = tv("Attempt 1 of $total", 16f, true)
+                  details.addView(delayRow)
+                  details.addView(tv("Loan day (meeting day): ${c.meetingDay}", 16f))
+                  details.addView(tv("NACH: ${c.nach}", 16f))
+                  details.addView(tv("Last paid on: ${c.lastPaid}", 16f))
+                  if (total > 1 || autoNext) {
+                      val st = tv(if (total > 1) "Attempt $attemptNo of $total" else "Auto-dial next: on", 16f, true)
                       statusTv = st
-                      box.addView(st)
+                      details.addView(st)
                   } else statusTv = null
-                  box.addView(Button(this).apply {
-                      text = if (total > 1) "Stop redial" else "Hide"
+                  details.addView(Button(this).apply {
+                      text = if (total > 1 || autoNext) "Stop" else "Hide"
                       setOnClickListener { stopSelf() }
                   })
+                  box.addView(details)
+          
+                  fun applyState() {
+                      details.visibility = if (minimized) View.GONE else View.VISIBLE
+                      toggle.text = if (minimized) "Maximize" else "Minimize"
+                  }
+                  toggle.setOnClickListener { minimized = !minimized; applyState() }
+                  applyState()
+          
                   val lp = WindowManager.LayoutParams(
                       WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT,
                       WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -416,7 +446,7 @@ jobs:
               }
           
               private fun onCallEnded() {
-                  if (total <= 1) { stopSelf(); return }
+                  if (total <= 1 && !autoNext) { stopSelf(); return }
                   // give Android a moment to write the call to the call log, then see how long it lasted
                   handler.postDelayed({ checkAndMaybeRedial() }, 2000)
               }
@@ -427,13 +457,43 @@ jobs:
                   if (last?.handle != null) simHandle = last.handle   // remember which SIM was used
                   val duration = last?.duration
                   when {
-                      duration == null || duration > 0 -> stopSelf()          // answered (or cannot tell): stop
+                      duration == null || duration > 0 -> finishCurrent()      // answered (or cannot tell): done with this one
                       attemptNo >= total -> {                                  // last attempt, still no answer
-                          statusTv?.text = "No answer after $total attempts"
-                          handler.postDelayed({ stopSelf() }, 6000)
+                          statusTv?.text = if (total > 1) "No answer after $total attempts" else "No answer"
+                          handler.postDelayed({ finishCurrent() }, 2500)
                       }
                       else -> startCountdown(waitSeconds)
                   }
+              }
+          
+              /** Done with this customer: dial the next one automatically, or stop at the end of the list. */
+              private fun finishCurrent() {
+                  if (autoNext && idx >= 0 && idx + 1 < list.size) startNextCountdown(5) else stopSelf()
+              }
+          
+              private fun startNextCountdown(sec: Int) {
+                  val nextName = list[idx + 1].name
+                  var left = sec
+                  val r = object : Runnable {
+                      override fun run() {
+                          if (left > 0) {
+                              statusTv?.text = "Next: $nextName in ${left}s"
+                              left--
+                              handler.postDelayed(this, 1000)
+                          } else dialNext()
+                      }
+                  }
+                  handler.post(r)
+              }
+          
+              private fun dialNext() {
+                  idx++
+                  val c = list[idx]
+                  client = c
+                  attemptNo = 1
+                  sawOffhook = false
+                  show(c)
+                  placeCallTo(c.phone)
               }
           
               /** Most recent outgoing call to [phone]: its duration (0 = nobody answered) and the SIM it used. */
@@ -482,11 +542,15 @@ jobs:
                   attemptNo++
                   statusTv?.text = "Calling... attempt $attemptNo of $total"
                   sawOffhook = false
+                  placeCallTo(c.phone)
+              }
+          
+              /** Places a call without any prompt, on the same SIM as the first call. */
+              private fun placeCallTo(phone: String) {
                   try {
                       val extras = Bundle()
-                      // same SIM as the first call, so Android does not ask "Make calls with" again
                       simHandle?.let { extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, it) }
-                      (getSystemService(TELECOM_SERVICE) as TelecomManager).placeCall(Uri.parse("tel:${c.phone}"), extras)
+                      (getSystemService(TELECOM_SERVICE) as TelecomManager).placeCall(Uri.parse("tel:$phone"), extras)
                   } catch (e: Exception) {
                       stopSelf()
                   }
@@ -536,6 +600,7 @@ jobs:
               private lateinit var listBox: LinearLayout
               private lateinit var attemptsEt: EditText
               private lateinit var waitEt: EditText
+              private lateinit var autoCb: CheckBox
               private var photoUri: Uri? = null
               private var pending: Client? = null
               private var clients = listOf<Client>()
@@ -571,7 +636,7 @@ jobs:
           
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
-                  title = "Smart Dialer v7"
+                  title = "Smart Dialer v9"
                   window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN)
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 24, 24, 24) }
                   val bar = LinearLayout(this)
@@ -594,6 +659,11 @@ jobs:
                   waitEt = numberField("10")
                   root.addView(labelRow("Call attempts (1 = no redial)", attemptsEt))
                   root.addView(labelRow("Wait between attempts (seconds)", waitEt))
+                  autoCb = CheckBox(this).apply {
+                      text = "Auto-dial the next customer after each call"
+                      isChecked = false
+                  }
+                  root.addView(autoCb)
                   listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                   root.addView(ScrollView(this).apply { addView(listBox) })
                   setContentView(root)
@@ -620,7 +690,7 @@ jobs:
                       setPadding(60, 40, 60, 10)
                   }
                   box.addView(TextView(this).apply {
-                      text = "Smart Dialer v7"
+                      text = "Smart Dialer v9"
                       textSize = 20f
                       setTypeface(typeface, Typeface.BOLD)
                   })
@@ -680,7 +750,7 @@ jobs:
                   val attempts = (attemptsEt.text.toString().toIntOrNull() ?: 1).coerceIn(1, 20)
                   val wait = (waitEt.text.toString().toIntOrNull() ?: 10).coerceIn(3, 300)
                   val wanted = mutableListOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE)
-                  if (attempts > 1) wanted.add(Manifest.permission.READ_CALL_LOG)
+                  if (attempts > 1 || autoCb.isChecked) wanted.add(Manifest.permission.READ_CALL_LOG)
                   val need = wanted
                       .filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
                   if (need.isNotEmpty()) { perms.launch(need.toTypedArray()); return }
@@ -690,7 +760,7 @@ jobs:
                   startService(Intent(this, OverlayService::class.java)
                       .putExtra("name", c.name).putExtra("phone", c.phone).putExtra("day", c.meetingDay)
                       .putExtra("nach", c.nach).putExtra("last", c.lastPaid)
-                      .putExtra("attempts", attempts).putExtra("wait", wait))
+                      .putExtra("attempts", attempts).putExtra("wait", wait).putExtra("auto", autoCb.isChecked))
                   startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:${c.phone}")))
               }
           }
