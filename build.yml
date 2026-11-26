@@ -91,6 +91,7 @@ jobs:
           package com.example.smartdialer
           
           import android.content.Context
+          import android.graphics.Rect
           import com.google.mlkit.vision.text.Text
           import org.json.JSONArray
           import org.json.JSONObject
@@ -136,61 +137,75 @@ jobs:
           }
           
           object SheetParser {
-              private val dateRx = Regex("""\d{1,2}/\d{1,2}/\d{4}""")
-              private val phoneRx = Regex("""(?<!\d)[6-9]\d{4} ?\d{5}(?!\d)""")
-              private val dayRx = Regex("""(?<!\d)(\d{1,2})(?!\d)""")
-              private val hasDigit = Regex("""\d""")
+              private val dateFind = Regex("""\d{1,2}/\d{1,2}/\d{4}""")
+              private val phoneRx = Regex("""^[6-9]\d{9}$""")
+              private val dayRx = Regex("""^\d{1,2}$""")
           
-              /** Horizontal range of the column whose header contains [key] (e.g. "cust" for Customer Name). */
-              private fun colRange(all: List<Text.Line>, key: String): Pair<Int, Int>? {
-                  val h = all.firstOrNull { it.text.contains(key, true) } ?: return null
-                  val hb = h.boundingBox!!
-                  val right = all.filter {
-                      val b = it.boundingBox!!
-                      it !== h && abs(b.centerY() - hb.centerY()) < hb.height() * 1.2 && b.left > hb.right - 5
-                  }.minOfOrNull { it.boundingBox!!.left } ?: Int.MAX_VALUE
-                  return Pair(hb.left - 30, if (right == Int.MAX_VALUE) right else right - 5)
+              private class W(val t: String, val b: Rect) {
+                  val cy: Int get() = b.centerY()
               }
           
-              private fun inCol(row: List<Text.Line>, rg: Pair<Int, Int>?): String? =
-                  rg?.let { r ->
-                      row.filter { it.boundingBox!!.centerX() in r.first..r.second }
-                          .sortedBy { it.boundingBox!!.left }
-                          .joinToString(" ") { it.text.trim() }.trim()
-                  }
+              private class R(val name: String, val phone: String, val day: Int, val nach: String, val last: String)
           
+              /**
+               * Each mobile number is the anchor of one table row. Everything else is picked relative to it:
+               *  - name       = words to the LEFT of the mobile number (the Customer Name column), so Scheme Name can never be used
+               *  - meeting day= a 1-2 digit number to the right
+               *  - last paid  = a date to the right
+               *  - NACH       = letters between meeting day and last paid date
+               * Only words at the same height as the phone number (within 60% of the row spacing) are used,
+               * so a tilted or curved photo still works.
+               */
               fun parse(text: Text): List<Client> {
-                  val lines = text.textBlocks.flatMap { it.lines }.filter { it.boundingBox != null }
-                      .sortedBy { it.boundingBox!!.centerY() }
-                  // group OCR lines into table rows by vertical position
-                  val rows = mutableListOf<MutableList<Text.Line>>()
-                  for (l in lines) {
-                      val b = l.boundingBox!!
-                      val last = rows.lastOrNull()
-                      if (last != null && abs(last[0].boundingBox!!.centerY() - b.centerY()) < b.height() * 0.6) last.add(l)
-                      else rows.add(mutableListOf(l))
+                  val words = mutableListOf<W>()
+                  val lineBoxes = mutableListOf<W>()
+                  for (blk in text.textBlocks) for (ln in blk.lines) {
+                      ln.boundingBox?.let { lineBoxes.add(W(ln.text.trim(), it)) }
+                      for (el in ln.elements) el.boundingBox?.let { words.add(W(el.text.trim(), it)) }
                   }
-                  val custCol = colRange(lines, "cust")   // "Customer Name" column
-                  val nachCol = colRange(lines, "nach")   // "NACH" column
-                  val out = mutableListOf<Client>()
-                  for (row in rows) {
-                      val parts = row.sortedBy { it.boundingBox!!.left }.map { it.text.trim() }
-                      val joined = parts.joinToString(" ")
-                      val phoneM = phoneRx.find(joined) ?: continue // header/other rows have no phone
-                      val date = dateRx.find(joined)?.value ?: ""
-                      val colName = inCol(row, custCol)
-                      val name = if (!colName.isNullOrBlank()) colName
-                          else (parts.firstOrNull { p -> p.any { it.isLetter() } && !hasDigit.containsMatchIn(p) } ?: continue)
-                      val colNach = inCol(row, nachCol)
-                      val nach = if (colNach != null) colNach
-                          else (parts.firstOrNull { it != name && it.any { c -> c.isLetter() } && !hasDigit.containsMatchIn(it) } ?: "")
-                      var after = joined.substring(phoneM.range.last + 1).replace(date, "")
-                      var day = dayRx.findAll(after).map { it.groupValues[1].toInt() }.firstOrNull { it in 1..31 }
-                      if (day == null) day = dayRx.findAll(joined.replace(date, "").replace(phoneM.value, ""))
-                          .map { it.groupValues[1].toInt() }.lastOrNull { it in 1..31 } ?: 0
-                      out.add(Client(name, phoneM.value.replace(" ", ""), day, nach, date))
+                  val phones = mutableListOf<Pair<String, W>>()
+                  fun addPhone(num: String, w: W) {
+                      if (phones.none { it.first == num && abs(it.second.cy - w.cy) < 10 }) phones.add(num to w)
                   }
-                  return out
+                  words.forEach { if (phoneRx.matches(it.t)) addPhone(it.t, it) }
+                  lineBoxes.forEach { val s = it.t.replace(" ", ""); if (phoneRx.matches(s)) addPhone(s, it) }
+                  val sorted = phones.sortedBy { it.second.cy }
+                  if (sorted.isEmpty()) return emptyList()
+          
+                  val diffs = sorted.zipWithNext { a, b -> b.second.cy - a.second.cy }.filter { it > 5 }.sorted()
+                  val pitch = if (diffs.isEmpty()) 40 else diffs[diffs.size / 2]
+                  val win = pitch * 0.6
+          
+                  val raw = mutableListOf<R>()
+                  for ((num, p) in sorted) {
+                      fun near(pred: (W) -> Boolean): W? =
+                          words.filter { pred(it) && abs(it.cy - p.cy) < win }.minByOrNull { abs(it.cy - p.cy) }
+          
+                      // name: words left of the phone number
+                      val tokens = words.filter { it.b.right <= p.b.left + 15 && abs(it.cy - p.cy) < win }
+                          .sortedBy { it.b.left }
+                          .map { w -> w.t.filter { c -> c.isLetter() || c == '.' } }
+                          .filter { it.isNotEmpty() }
+                      val firstUpper = tokens.firstOrNull()?.none { it.isLowerCase() } ?: false
+                      val name = tokens.filter { !firstUpper || it.none { c -> c.isLowerCase() } }
+                          .joinToString(" ").trim().ifEmpty { num }
+          
+                      val dayW = near { dayRx.matches(it.t) && it.b.left > p.b.right && it.t.toInt() in 1..31 }
+                      val dateW = near { dateFind.containsMatchIn(it.t) && it.b.left > p.b.right }
+                      val date = dateW?.let { dateFind.find(it.t)!!.value } ?: ""
+          
+                      val lo = dayW?.b?.right ?: dateW?.let { it.b.left - 2 * it.b.width() } ?: Int.MAX_VALUE
+                      val hi = dateW?.b?.left ?: Int.MAX_VALUE
+                      val nach = words.filter {
+                          it.b.centerX() in lo..hi && abs(it.cy - p.cy) < win && it.t.any { c -> c.isLetter() }
+                      }.sortedBy { it.b.left }.joinToString(" ") { it.t }.trim()
+          
+                      raw.add(R(name, num, dayW?.t?.toInt() ?: 0, nach, date))
+                  }
+                  // if a meeting day could not be read for a row, use the most common one on the sheet
+                  val mode = raw.map { it.day }.filter { it > 0 }.groupingBy { it }.eachCount()
+                      .maxByOrNull { it.value }?.key ?: 0
+                  return raw.map { Client(it.name, it.phone, if (it.day > 0) it.day else mode, it.nach, it.last) }
               }
           }
           EOF_FILE
