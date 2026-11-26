@@ -15,14 +15,12 @@ jobs:
       - name: Create project files
         run: |
           printf 'android.useAndroidX=true\norg.gradle.jvmargs=-Xmx2048m\n' > gradle.properties
-          true
           cat > settings.gradle.kts <<'EOF_FILE'
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement { repositories { google(); mavenCentral() } }
           rootProject.name = "SmartDialer"
           include(":app")
           EOF_FILE
-          true
           cat > build.gradle.kts <<'EOF_FILE'
           plugins {
               id("com.android.application") version "8.5.2" apply false
@@ -69,6 +67,7 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.CALL_PHONE" />
               <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.READ_CALL_LOG" />
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
               <uses-permission android:name="android.permission.CAMERA" />
               <uses-feature android:name="android.hardware.telephony" android:required="false" />
@@ -93,6 +92,7 @@ jobs:
           package com.example.smartdialer
           
           import android.content.Context
+          import android.graphics.Rect
           import com.google.mlkit.vision.text.Text
           import org.json.JSONArray
           import org.json.JSONObject
@@ -138,37 +138,156 @@ jobs:
           }
           
           object SheetParser {
-              private val dateRx = Regex("""\d{1,2}/\d{1,2}/\d{4}""")
-              private val phoneRx = Regex("""(?<!\d)[6-9]\d{4} ?\d{5}(?!\d)""")
-              private val dayRx = Regex("""(?<!\d)(\d{1,2})(?!\d)""")
-              private val hasDigit = Regex("""\d""")
+              private val dateFind = Regex("""\d{1,2}/\d{1,2}/\d{4}""")
+              private val phoneRx = Regex("""^[6-9]\d{9}$""")
+              private val dayRx = Regex("""^\d{1,2}$""")
           
+              private class W(val t: String, val b: Rect) {
+                  val cy: Int get() = b.centerY()
+                  val cx: Int get() = b.centerX()
+              }
+          
+              /** one table row: its phone number, name, and the cells found to the right of the phone (centre x, text) */
+              private class T(val num: String, val name: String, val cells: List<Pair<Int, String>>)
+          
+              /** OCR often reads 0 as O and 1 as l/I inside dates. */
+              private fun fixDate(s: String): String =
+                  if (s.contains('/')) s.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1').replace('|', '1') else s
+          
+              /** Reads a meeting day (1-31); tolerates B read for 8, O for 0, l/I for 1. */
+              private fun toDay(s: String): Int? {
+                  val t = s.trim().replace('B', '8').replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1')
+                  return if (dayRx.matches(t)) t.toInt().takeIf { it in 1..31 } else null
+              }
+          
+              /**
+               * Standard sheet (counted by column, headers are NOT needed):
+               *   1 code | 2 centre | 3 CUSTOMER NAME | 4 PHONE | 5 scheme | 6 loan | 7 EWI | 8 MEETING DAY | 9 NACH STATUS | 10 LAST PAID ON
+               * Each phone number (column 4) anchors one row. Column 3 is the cell directly left of it.
+               * Columns 5-10 are found by grouping the cells right of the phone into vertical columns across ALL rows
+               * and counting them from the phone: 4th = meeting day, 5th = NACH, 6th = last paid.
+               * Photo tilt is measured and corrected for, and blank cells simply stay blank.
+               */
               fun parse(text: Text): List<Client> {
-                  val lines = text.textBlocks.flatMap { it.lines }.filter { it.boundingBox != null }
-                      .sortedBy { it.boundingBox!!.centerY() }
-                  // group OCR lines into table rows by vertical position
-                  val rows = mutableListOf<MutableList<Text.Line>>()
-                  for (l in lines) {
-                      val b = l.boundingBox!!
-                      val last = rows.lastOrNull()
-                      if (last != null && abs(last[0].boundingBox!!.centerY() - b.centerY()) < b.height() * 0.6) last.add(l)
-                      else rows.add(mutableListOf(l))
+                  val words = mutableListOf<W>()
+                  val lineBoxes = mutableListOf<W>()
+                  for (blk in text.textBlocks) for (ln in blk.lines) {
+                      ln.boundingBox?.let { lineBoxes.add(W(ln.text.trim(), it)) }
+                      for (el in ln.elements) el.boundingBox?.let { words.add(W(el.text.trim(), it)) }
                   }
-                  val out = mutableListOf<Client>()
-                  for (row in rows) {
-                      val parts = row.sortedBy { it.boundingBox!!.left }.map { it.text.trim() }
-                      val joined = parts.joinToString(" ")
-                      val phoneM = phoneRx.find(joined) ?: continue // header/other rows have no phone
-                      val date = dateRx.find(joined)?.value ?: ""
-                      val name = parts.firstOrNull { p -> p.any { it.isLetter() } && !hasDigit.containsMatchIn(p) } ?: continue
-                      val nach = parts.firstOrNull { it != name && it.any { c -> c.isLetter() } && !hasDigit.containsMatchIn(it) } ?: ""
-                      var after = joined.substring(phoneM.range.last + 1).replace(date, "")
-                      var day = dayRx.findAll(after).map { it.groupValues[1].toInt() }.firstOrNull { it in 1..31 }
-                      if (day == null) day = dayRx.findAll(joined.replace(date, "").replace(phoneM.value, ""))
-                          .map { it.groupValues[1].toInt() }.lastOrNull { it in 1..31 } ?: 0
-                      out.add(Client(name, phoneM.value.replace(" ", ""), day, nach, date))
+                  if (words.isEmpty()) return emptyList()
+          
+                  val phones = mutableListOf<Pair<String, W>>()
+                  fun addPhone(num: String, w: W) {
+                      if (phones.none { it.first == num && abs(it.second.cy - w.cy) < 10 }) phones.add(num to w)
                   }
-                  return out
+                  words.forEach { if (phoneRx.matches(it.t)) addPhone(it.t, it) }
+                  lineBoxes.forEach { val s = it.t.replace(" ", ""); if (phoneRx.matches(s)) addPhone(s, it) }
+                  val sorted = phones.sortedBy { it.second.cy }
+                  if (sorted.isEmpty()) return emptyList()
+          
+                  val diffs = sorted.zipWithNext { a, b -> b.second.cy - a.second.cy }.filter { it > 5 }.sorted()
+                  val pitch = if (diffs.isEmpty()) 40 else diffs[diffs.size / 2]
+                  val win = pitch * 0.5
+                  val h = words.map { it.b.height() }.sorted()[words.size / 2]
+                  val nameGap = h * 2.5   // max gap inside one name cell
+                  val cellGap = h * 1.3   // gap that separates two cells on the right side
+          
+                  // measure photo tilt (vertical drift per horizontal pixel) using dates and meeting days
+                  val tiltWords = words.filter { w -> dateFind.containsMatchIn(fixDate(w.t)) || toDay(w.t) != null }
+                  var k = 0.0
+                  repeat(4) {
+                      val ks = mutableListOf<Double>()
+                      for (w in tiltWords) {
+                          val best = sorted.minByOrNull { abs(w.cy - (it.second.cy + k * (w.cx - it.second.cx))) } ?: continue
+                          val dx = w.cx - best.second.cx
+                          if (dx < 200) continue
+                          val resid = w.cy - (best.second.cy + k * dx)
+                          if (abs(resid) < pitch * 0.5) ks.add(k + resid / dx)
+                      }
+                      if (ks.isNotEmpty()) k = ks.sorted()[ks.size / 2]
+                  }
+                  val tilt = k
+                  fun ey(p: W, w: W): Double = if (w.cx > p.cx) p.cy + tilt * (w.cx - p.cx) else p.cy.toDouble()
+                  fun isDate(w: W) = dateFind.containsMatchIn(fixDate(w.t))
+          
+                  val rows = mutableListOf<T>()
+                  for ((num, p) in sorted) {
+                      // ---- column 3: customer name = the cell directly left of the phone
+                      val leftWords = words.filter { it.b.right <= p.b.left + 15 && abs(it.cy - p.cy) < win }
+                          .sortedByDescending { it.b.left }
+                      val nameCell = mutableListOf<W>()
+                      var prevLeft = p.b.left
+                      for (w in leftWords) {
+                          if (nameCell.isNotEmpty() && prevLeft - w.b.right > nameGap) break
+                          nameCell.add(w)
+                          prevLeft = w.b.left
+                      }
+                      val tokens = nameCell.sortedBy { it.b.left }
+                          .map { w -> w.t.filter { c -> c.isLetter() || c == '.' } }
+                          .filter { it.isNotEmpty() }
+                      val firstUpper = tokens.firstOrNull()?.none { it.isLowerCase() } ?: false
+                      val name = tokens.filter { !firstUpper || it.none { c -> c.isLowerCase() } }
+                          .joinToString(" ").trim().ifEmpty { num }
+          
+                      // ---- columns 5..: cells right of the phone (a date is always its own cell)
+                      val rightWords = words.filter { it.b.left > p.b.right - 5 && abs(it.cy - ey(p, it)) < win }
+                          .sortedBy { it.b.left }
+                      val cells = mutableListOf<MutableList<W>>()
+                      for (w in rightWords) {
+                          val last = cells.lastOrNull()
+                          val startNew = last == null || isDate(w) || isDate(last.last()) ||
+                              w.b.left - last.last().b.right > cellGap
+                          if (startNew) cells.add(mutableListOf(w)) else last!!.add(w)
+                      }
+                      rows.add(T(num, name, cells.map { c ->
+                          Pair((c.first().b.left + c.last().b.right) / 2, c.joinToString(" ") { it.t })
+                      }))
+                  }
+          
+                  // ---- group cells into vertical columns across all rows (centre x of cells in one column is the same)
+                  val centers = rows.flatMap { r -> r.cells.map { it.first } }.sorted()
+                  val bounds = mutableListOf<Int>()
+                  for (i in 1 until centers.size) {
+                      if (centers[i] - centers[i - 1] > h * 3) bounds.add((centers[i] + centers[i - 1]) / 2)
+                  }
+                  val nCols = bounds.size + 1
+                  val grid = rows.map { r ->
+                      val arr = Array(nCols) { "" }
+                      for ((cx, t) in r.cells) {
+                          val i = bounds.count { it < cx }
+                          arr[i] = (arr[i] + " " + t).trim()
+                      }
+                      arr
+                  }
+          
+                  // counting from the phone: 4th column right of it = meeting day (8), 5th = NACH (9), 6th = last paid (10)
+                  var dayIdx = 3
+                  var nachIdx = 4
+                  var dateIdx = 5
+                  fun dateCount(c: Int) = grid.count { dateFind.containsMatchIn(fixDate(it.getOrNull(c) ?: "")) }
+                  if (nCols < 6 || dateCount(5) * 10 < grid.size * 3) {
+                      // safety net: column count did not give a column of dates, so locate the dates column and count back from it
+                      val best = (0 until nCols).maxByOrNull { dateCount(it) }
+                      if (best != null && dateCount(best) > 0 && best >= 2) {
+                          dateIdx = best; nachIdx = best - 1; dayIdx = best - 2
+                      }
+                  }
+          
+                  val days = grid.map { g ->
+                      (g.getOrNull(dayIdx) ?: "").split(" ").firstNotNullOfOrNull { toDay(it) } ?: 0
+                  }
+                  // the meeting day is normally the same for the whole sheet: if 80%+ agree, use it for every row
+                  val counts = days.filter { it > 0 }.groupingBy { it }.eachCount()
+                  val top = counts.maxByOrNull { it.value }
+                  val mode = top?.key ?: 0
+                  val unify = top != null && top.value >= 0.8 * counts.values.sum()
+          
+                  return rows.mapIndexed { i, r ->
+                      val nach = (grid[i].getOrNull(nachIdx) ?: "").filter { it.isLetter() || it == ' ' }.trim()
+                      val last = dateFind.find(fixDate(grid[i].getOrNull(dateIdx) ?: ""))?.value ?: ""
+                      Client(r.name, r.num, if (unify || days[i] == 0) mode else days[i], nach, last)
+                  }
               }
           }
           EOF_FILE
@@ -180,7 +299,13 @@ jobs:
           import android.content.Intent
           import android.graphics.Color
           import android.graphics.PixelFormat
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Handler
           import android.os.IBinder
+          import android.os.Looper
+          import android.provider.CallLog
+          import android.telecom.TelecomManager
           import android.telephony.PhoneStateListener
           import android.telephony.TelephonyManager
           import android.view.Gravity
@@ -196,7 +321,13 @@ jobs:
               private var wm: WindowManager? = null
               private var tm: TelephonyManager? = null
               private var listener: PhoneStateListener? = null
+              private val handler = Handler(Looper.getMainLooper())
+              private var statusTv: TextView? = null
+              private var client: Client? = null
               private var sawOffhook = false
+              private var total = 1
+              private var attemptNo = 1
+              private val waitSeconds = 30   // pause between redial attempts
           
               override fun onBind(i: Intent?): IBinder? = null
           
@@ -206,8 +337,13 @@ jobs:
                       i.getStringExtra("name") ?: "", i.getStringExtra("phone") ?: "",
                       i.getIntExtra("day", 0), i.getStringExtra("nach") ?: "", i.getStringExtra("last") ?: ""
                   )
+                  handler.removeCallbacksAndMessages(null)
+                  client = c
+                  total = i.getIntExtra("attempts", 1).coerceAtLeast(1)
+                  attemptNo = 1
+                  sawOffhook = false
                   show(c)
-                  listenForCallEnd()
+                  if (listener == null) listenForCallEnd()
                   return START_NOT_STICKY
               }
           
@@ -228,7 +364,14 @@ jobs:
                   box.addView(tv("NACH: ${c.nach}", 16f))
                   box.addView(tv("Last paid on: ${c.lastPaid}", 16f))
                   if (late) box.addView(tv("DELAYED PAYMENT", 18f, true))
-                  box.addView(Button(this).apply { text = "Hide"; setOnClickListener { stopSelf() } })
+                  if (total > 1) {
+                      statusTv = tv("Attempt 1 of $total", 16f, true)
+                      box.addView(statusTv)
+                  } else statusTv = null
+                  box.addView(Button(this).apply {
+                      text = if (total > 1) "Stop redial" else "Hide"
+                      setOnClickListener { stopSelf() }
+                  })
                   val lp = WindowManager.LayoutParams(
                       WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT,
                       WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -245,16 +388,84 @@ jobs:
                   listener = object : PhoneStateListener() {
                       override fun onCallStateChanged(state: Int, number: String?) {
                           if (state == TelephonyManager.CALL_STATE_OFFHOOK) sawOffhook = true
-                          if (state == TelephonyManager.CALL_STATE_IDLE && sawOffhook) stopSelf()
+                          if (state == TelephonyManager.CALL_STATE_IDLE && sawOffhook) {
+                              sawOffhook = false
+                              onCallEnded()
+                          }
                       }
                   }
                   tm!!.listen(listener, PhoneStateListener.LISTEN_CALL_STATE)
               }
           
+              private fun onCallEnded() {
+                  if (total <= 1) { stopSelf(); return }
+                  // give Android a moment to write the call to the call log, then see how long it lasted
+                  handler.postDelayed({ checkAndMaybeRedial() }, 3000)
+              }
+          
+              private fun checkAndMaybeRedial() {
+                  val c = client ?: return
+                  val duration = lastOutgoingDuration(c.phone)
+                  when {
+                      duration == null || duration > 0 -> stopSelf()          // answered (or cannot tell): stop
+                      attemptNo >= total -> {                                  // last attempt, still no answer
+                          statusTv?.text = "No answer after $total attempts"
+                          handler.postDelayed({ stopSelf() }, 6000)
+                      }
+                      else -> startCountdown(waitSeconds)
+                  }
+              }
+          
+              /** Duration in seconds of the most recent outgoing call to [phone]; 0 = nobody answered. null = unknown. */
+              private fun lastOutgoingDuration(phone: String): Int? {
+                  return try {
+                      contentResolver.query(
+                          CallLog.Calls.CONTENT_URI,
+                          arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.DURATION, CallLog.Calls.TYPE),
+                          null, null, CallLog.Calls.DATE + " DESC"
+                      )?.use { cur ->
+                          if (cur.moveToFirst()) {
+                              val num = (cur.getString(0) ?: "").filter { it.isDigit() }
+                              val dur = cur.getInt(1)
+                              val type = cur.getInt(2)
+                              if (type == CallLog.Calls.OUTGOING_TYPE && num.endsWith(phone.takeLast(10))) dur else null
+                          } else null
+                      }
+                  } catch (e: Exception) { null }
+              }
+          
+              private fun startCountdown(sec: Int) {
+                  var left = sec
+                  val r = object : Runnable {
+                      override fun run() {
+                          if (left > 0) {
+                              statusTv?.text = "No answer. Redialing in ${left}s (attempt ${attemptNo + 1} of $total)"
+                              left--
+                              handler.postDelayed(this, 1000)
+                          } else redial()
+                      }
+                  }
+                  handler.post(r)
+              }
+          
+              private fun redial() {
+                  val c = client ?: return
+                  attemptNo++
+                  statusTv?.text = "Calling... attempt $attemptNo of $total"
+                  sawOffhook = false
+                  try {
+                      (getSystemService(TELECOM_SERVICE) as TelecomManager).placeCall(Uri.parse("tel:${c.phone}"), Bundle())
+                  } catch (e: Exception) {
+                      stopSelf()
+                  }
+              }
+          
               private fun removeView() { view?.let { try { wm?.removeView(it) } catch (_: Exception) {} }; view = null }
           
               override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
                   listener?.let { tm?.listen(it, PhoneStateListener.LISTEN_NONE) }
+                  listener = null
                   removeView()
                   super.onDestroy()
               }
@@ -271,6 +482,8 @@ jobs:
           import android.net.Uri
           import android.os.Bundle
           import android.provider.Settings
+          import android.text.InputType
+          import android.view.Gravity
           import android.widget.*
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.appcompat.app.AppCompatActivity
@@ -283,6 +496,7 @@ jobs:
           
           class MainActivity : AppCompatActivity() {
               private lateinit var listBox: LinearLayout
+              private lateinit var attemptsEt: EditText
               private var photoUri: Uri? = null
               private var pending: Client? = null
               private var clients = listOf<Client>()
@@ -295,6 +509,7 @@ jobs:
           
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
+                  title = "Smart Dialer v6"
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 24, 24, 24) }
                   val bar = LinearLayout(this)
                   bar.addView(Button(this).apply {
@@ -312,6 +527,25 @@ jobs:
                       setOnClickListener { pickPic.launch("image/*") }
                   })
                   root.addView(bar)
+                  val attemptRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(8, 16, 8, 8)
+                  }
+                  attemptRow.addView(TextView(this).apply {
+                      text = "Call attempts (1 = no redial)"
+                      textSize = 15f
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+                  })
+                  attemptsEt = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      setText("1")
+                      setSelectAllOnFocus(true)
+                      gravity = Gravity.CENTER
+                      minEms = 3
+                  }
+                  attemptRow.addView(attemptsEt)
+                  root.addView(attemptRow)
                   listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                   root.addView(ScrollView(this).apply { addView(listBox) })
                   setContentView(root)
@@ -353,13 +587,16 @@ jobs:
                       startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
                       return
                   }
-                  val need = arrayOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE)
+                  val attempts = (attemptsEt.text.toString().toIntOrNull() ?: 1).coerceIn(1, 20)
+                  val wanted = mutableListOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE)
+                  if (attempts > 1) wanted.add(Manifest.permission.READ_CALL_LOG)
+                  val need = wanted
                       .filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
                   if (need.isNotEmpty()) { perms.launch(need.toTypedArray()); return }
                   pending = null
                   startService(Intent(this, OverlayService::class.java)
                       .putExtra("name", c.name).putExtra("phone", c.phone).putExtra("day", c.meetingDay)
-                      .putExtra("nach", c.nach).putExtra("last", c.lastPaid))
+                      .putExtra("nach", c.nach).putExtra("last", c.lastPaid).putExtra("attempts", attempts))
                   startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:${c.phone}")))
               }
           }
