@@ -146,19 +146,26 @@ jobs:
                   val cx: Int get() = b.centerX()
               }
           
-              private class T(val num: String, val p: W, val name: String, val dayW: W?, val dateW: W?)
+              /** one table row: its phone number, name, and the cells found to the right of the phone (centre x, text) */
+              private class T(val num: String, val name: String, val cells: List<Pair<Int, String>>)
           
               /** OCR often reads 0 as O and 1 as l/I inside dates. */
               private fun fixDate(s: String): String =
                   if (s.contains('/')) s.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1').replace('|', '1') else s
           
+              /** Reads a meeting day (1-31); tolerates B read for 8, O for 0, l/I for 1. */
+              private fun toDay(s: String): Int? {
+                  val t = s.trim().replace('B', '8').replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1')
+                  return if (dayRx.matches(t)) t.toInt().takeIf { it in 1..31 } else null
+              }
+          
               /**
-               * Every mobile number anchors one table row; the other cells are found relative to it.
-               *  - name        = the cell directly LEFT of the mobile number (words close together; ignores code/centre columns further left)
-               *  - meeting day = first 1-2 digit number to the right
-               *  - last paid   = first date to the right
-               *  - NACH        = letters in the column between meeting day and last paid
-               * The tilt of the photo is measured from the dates / meeting days and corrected for.
+               * Standard sheet (counted by column, headers are NOT needed):
+               *   1 code | 2 centre | 3 CUSTOMER NAME | 4 PHONE | 5 scheme | 6 loan | 7 EWI | 8 MEETING DAY | 9 NACH STATUS | 10 LAST PAID ON
+               * Each phone number (column 4) anchors one row. Column 3 is the cell directly left of it.
+               * Columns 5-10 are found by grouping the cells right of the phone into vertical columns across ALL rows
+               * and counting them from the phone: 4th = meeting day, 5th = NACH, 6th = last paid.
+               * Photo tilt is measured and corrected for, and blank cells simply stay blank.
                */
               fun parse(text: Text): List<Client> {
                   val words = mutableListOf<W>()
@@ -182,12 +189,11 @@ jobs:
                   val pitch = if (diffs.isEmpty()) 40 else diffs[diffs.size / 2]
                   val win = pitch * 0.5
                   val h = words.map { it.b.height() }.sorted()[words.size / 2]
-                  val gapThr = h * 2.5
+                  val nameGap = h * 2.5   // max gap inside one name cell
+                  val cellGap = h * 1.3   // gap that separates two cells on the right side
           
                   // measure photo tilt (vertical drift per horizontal pixel) using dates and meeting days
-                  val tiltWords = words.filter { w ->
-                      dateFind.containsMatchIn(fixDate(w.t)) || (dayRx.matches(w.t) && w.t.toInt() in 1..31)
-                  }
+                  val tiltWords = words.filter { w -> dateFind.containsMatchIn(fixDate(w.t)) || toDay(w.t) != null }
                   var k = 0.0
                   repeat(4) {
                       val ks = mutableListOf<Double>()
@@ -201,54 +207,84 @@ jobs:
                       if (ks.isNotEmpty()) k = ks.sorted()[ks.size / 2]
                   }
                   val tilt = k
-          
                   fun ey(p: W, w: W): Double = if (w.cx > p.cx) p.cy + tilt * (w.cx - p.cx) else p.cy.toDouble()
+                  fun isDate(w: W) = dateFind.containsMatchIn(fixDate(w.t))
           
-                  val tmp = mutableListOf<T>()
+                  val rows = mutableListOf<T>()
                   for ((num, p) in sorted) {
-                      fun near(pred: (W) -> Boolean): W? =
-                          words.filter { pred(it) && abs(it.cy - ey(p, it)) < win }.minByOrNull { it.b.left }
-          
-                      // name: walk left from the phone number while words stay close together (one cell)
+                      // ---- column 3: customer name = the cell directly left of the phone
                       val leftWords = words.filter { it.b.right <= p.b.left + 15 && abs(it.cy - p.cy) < win }
                           .sortedByDescending { it.b.left }
-                      val cell = mutableListOf<W>()
+                      val nameCell = mutableListOf<W>()
                       var prevLeft = p.b.left
                       for (w in leftWords) {
-                          if (cell.isNotEmpty() && prevLeft - w.b.right > gapThr) break
-                          cell.add(w)
+                          if (nameCell.isNotEmpty() && prevLeft - w.b.right > nameGap) break
+                          nameCell.add(w)
                           prevLeft = w.b.left
                       }
-                      val tokens = cell.sortedBy { it.b.left }
+                      val tokens = nameCell.sortedBy { it.b.left }
                           .map { w -> w.t.filter { c -> c.isLetter() || c == '.' } }
                           .filter { it.isNotEmpty() }
                       val firstUpper = tokens.firstOrNull()?.none { it.isLowerCase() } ?: false
                       val name = tokens.filter { !firstUpper || it.none { c -> c.isLowerCase() } }
                           .joinToString(" ").trim().ifEmpty { num }
           
-                      val dayW = near { it.b.left > p.b.right && dayRx.matches(it.t) && it.t.toInt() in 1..31 }
-                      val dateW = near { it.b.left > p.b.right && dateFind.containsMatchIn(fixDate(it.t)) }
-                      tmp.add(T(num, p, name, dayW, dateW))
+                      // ---- columns 5..: cells right of the phone (a date is always its own cell)
+                      val rightWords = words.filter { it.b.left > p.b.right - 5 && abs(it.cy - ey(p, it)) < win }
+                          .sortedBy { it.b.left }
+                      val cells = mutableListOf<MutableList<W>>()
+                      for (w in rightWords) {
+                          val last = cells.lastOrNull()
+                          val startNew = last == null || isDate(w) || isDate(last.last()) ||
+                              w.b.left - last.last().b.right > cellGap
+                          if (startNew) cells.add(mutableListOf(w)) else last!!.add(w)
+                      }
+                      rows.add(T(num, name, cells.map { c ->
+                          Pair((c.first().b.left + c.last().b.right) / 2, c.joinToString(" ") { it.t })
+                      }))
                   }
           
-                  // NACH column = between the meeting-day column and the last-paid column (same x range for all rows)
-                  val dayRights = tmp.mapNotNull { it.dayW?.b?.right }.sorted()
-                  val dateLefts = tmp.mapNotNull { it.dateW?.b?.left }.sorted()
-                  val nachLo = if (dayRights.isNotEmpty()) dayRights[dayRights.size / 2] else Int.MAX_VALUE
-                  val nachHi = if (dateLefts.isNotEmpty()) dateLefts[dateLefts.size / 10] else Int.MAX_VALUE
+                  // ---- group cells into vertical columns across all rows (centre x of cells in one column is the same)
+                  val centers = rows.flatMap { r -> r.cells.map { it.first } }.sorted()
+                  val bounds = mutableListOf<Int>()
+                  for (i in 1 until centers.size) {
+                      if (centers[i] - centers[i - 1] > h * 3) bounds.add((centers[i] + centers[i - 1]) / 2)
+                  }
+                  val nCols = bounds.size + 1
+                  val grid = rows.map { r ->
+                      val arr = Array(nCols) { "" }
+                      for ((cx, t) in r.cells) {
+                          val i = bounds.count { it < cx }
+                          arr[i] = (arr[i] + " " + t).trim()
+                      }
+                      arr
+                  }
           
+                  // counting from the phone: 4th column right of it = meeting day (8), 5th = NACH (9), 6th = last paid (10)
+                  var dayIdx = 3
+                  var nachIdx = 4
+                  var dateIdx = 5
+                  fun dateCount(c: Int) = grid.count { dateFind.containsMatchIn(fixDate(it.getOrNull(c) ?: "")) }
+                  if (nCols < 6 || dateCount(5) * 10 < grid.size * 3) {
+                      // safety net: column count did not give a column of dates, so locate the dates column and count back from it
+                      val best = (0 until nCols).maxByOrNull { dateCount(it) }
+                      if (best != null && dateCount(best) > 0 && best >= 2) {
+                          dateIdx = best; nachIdx = best - 1; dayIdx = best - 2
+                      }
+                  }
+          
+                  val days = grid.map { g ->
+                      (g.getOrNull(dayIdx) ?: "").split(" ").firstNotNullOfOrNull { toDay(it) } ?: 0
+                  }
                   // the meeting day is normally the same for the whole sheet: if 80%+ agree, use it for every row
-                  val days = tmp.map { it.dayW?.t?.toInt() ?: 0 }
                   val counts = days.filter { it > 0 }.groupingBy { it }.eachCount()
                   val top = counts.maxByOrNull { it.value }
                   val mode = top?.key ?: 0
                   val unify = top != null && top.value >= 0.8 * counts.values.sum()
           
-                  return tmp.mapIndexed { i, r ->
-                      val nach = words.filter {
-                          it.b.centerX() in nachLo..nachHi && abs(it.cy - ey(r.p, it)) < win && it.t.any { c -> c.isLetter() }
-                      }.sortedBy { it.b.left }.joinToString(" ") { it.t }.trim()
-                      val last = r.dateW?.let { dateFind.find(fixDate(it.t))!!.value } ?: ""
+                  return rows.mapIndexed { i, r ->
+                      val nach = (grid[i].getOrNull(nachIdx) ?: "").filter { it.isLetter() || it == ' ' }.trim()
+                      val last = dateFind.find(fixDate(grid[i].getOrNull(dateIdx) ?: ""))?.value ?: ""
                       Client(r.name, r.num, if (unify || days[i] == 0) mode else days[i], nach, last)
                   }
               }
