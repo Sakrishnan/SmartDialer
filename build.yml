@@ -143,18 +143,22 @@ jobs:
           
               private class W(val t: String, val b: Rect) {
                   val cy: Int get() = b.centerY()
+                  val cx: Int get() = b.centerX()
               }
           
-              private class R(val name: String, val phone: String, val day: Int, val nach: String, val last: String)
+              private class T(val num: String, val p: W, val name: String, val dayW: W?, val dateW: W?)
+          
+              /** OCR often reads 0 as O and 1 as l/I inside dates. */
+              private fun fixDate(s: String): String =
+                  if (s.contains('/')) s.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1').replace('|', '1') else s
           
               /**
-               * Each mobile number is the anchor of one table row. Everything else is picked relative to it:
-               *  - name       = words to the LEFT of the mobile number (the Customer Name column), so Scheme Name can never be used
-               *  - meeting day= a 1-2 digit number to the right
-               *  - last paid  = a date to the right
-               *  - NACH       = letters between meeting day and last paid date
-               * Only words at the same height as the phone number (within 60% of the row spacing) are used,
-               * so a tilted or curved photo still works.
+               * Every mobile number anchors one table row; the other cells are found relative to it.
+               *  - name        = the cell directly LEFT of the mobile number (words close together; ignores code/centre columns further left)
+               *  - meeting day = first 1-2 digit number to the right
+               *  - last paid   = first date to the right
+               *  - NACH        = letters in the column between meeting day and last paid
+               * The tilt of the photo is measured from the dates / meeting days and corrected for.
                */
               fun parse(text: Text): List<Client> {
                   val words = mutableListOf<W>()
@@ -163,6 +167,8 @@ jobs:
                       ln.boundingBox?.let { lineBoxes.add(W(ln.text.trim(), it)) }
                       for (el in ln.elements) el.boundingBox?.let { words.add(W(el.text.trim(), it)) }
                   }
+                  if (words.isEmpty()) return emptyList()
+          
                   val phones = mutableListOf<Pair<String, W>>()
                   fun addPhone(num: String, w: W) {
                       if (phones.none { it.first == num && abs(it.second.cy - w.cy) < 10 }) phones.add(num to w)
@@ -174,38 +180,77 @@ jobs:
           
                   val diffs = sorted.zipWithNext { a, b -> b.second.cy - a.second.cy }.filter { it > 5 }.sorted()
                   val pitch = if (diffs.isEmpty()) 40 else diffs[diffs.size / 2]
-                  val win = pitch * 0.6
+                  val win = pitch * 0.5
+                  val h = words.map { it.b.height() }.sorted()[words.size / 2]
+                  val gapThr = h * 2.5
           
-                  val raw = mutableListOf<R>()
+                  // measure photo tilt (vertical drift per horizontal pixel) using dates and meeting days
+                  val tiltWords = words.filter { w ->
+                      dateFind.containsMatchIn(fixDate(w.t)) || (dayRx.matches(w.t) && w.t.toInt() in 1..31)
+                  }
+                  var k = 0.0
+                  repeat(4) {
+                      val ks = mutableListOf<Double>()
+                      for (w in tiltWords) {
+                          val best = sorted.minByOrNull { abs(w.cy - (it.second.cy + k * (w.cx - it.second.cx))) } ?: continue
+                          val dx = w.cx - best.second.cx
+                          if (dx < 200) continue
+                          val resid = w.cy - (best.second.cy + k * dx)
+                          if (abs(resid) < pitch * 0.5) ks.add(k + resid / dx)
+                      }
+                      if (ks.isNotEmpty()) k = ks.sorted()[ks.size / 2]
+                  }
+                  val tilt = k
+          
+                  fun ey(p: W, w: W): Double = if (w.cx > p.cx) p.cy + tilt * (w.cx - p.cx) else p.cy.toDouble()
+          
+                  val tmp = mutableListOf<T>()
                   for ((num, p) in sorted) {
                       fun near(pred: (W) -> Boolean): W? =
-                          words.filter { pred(it) && abs(it.cy - p.cy) < win }.minByOrNull { abs(it.cy - p.cy) }
+                          words.filter { pred(it) && abs(it.cy - ey(p, it)) < win }.minByOrNull { it.b.left }
           
-                      // name: words left of the phone number
-                      val tokens = words.filter { it.b.right <= p.b.left + 15 && abs(it.cy - p.cy) < win }
-                          .sortedBy { it.b.left }
+                      // name: walk left from the phone number while words stay close together (one cell)
+                      val leftWords = words.filter { it.b.right <= p.b.left + 15 && abs(it.cy - p.cy) < win }
+                          .sortedByDescending { it.b.left }
+                      val cell = mutableListOf<W>()
+                      var prevLeft = p.b.left
+                      for (w in leftWords) {
+                          if (cell.isNotEmpty() && prevLeft - w.b.right > gapThr) break
+                          cell.add(w)
+                          prevLeft = w.b.left
+                      }
+                      val tokens = cell.sortedBy { it.b.left }
                           .map { w -> w.t.filter { c -> c.isLetter() || c == '.' } }
                           .filter { it.isNotEmpty() }
                       val firstUpper = tokens.firstOrNull()?.none { it.isLowerCase() } ?: false
                       val name = tokens.filter { !firstUpper || it.none { c -> c.isLowerCase() } }
                           .joinToString(" ").trim().ifEmpty { num }
           
-                      val dayW = near { dayRx.matches(it.t) && it.b.left > p.b.right && it.t.toInt() in 1..31 }
-                      val dateW = near { dateFind.containsMatchIn(it.t) && it.b.left > p.b.right }
-                      val date = dateW?.let { dateFind.find(it.t)!!.value } ?: ""
-          
-                      val lo = dayW?.b?.right ?: dateW?.let { it.b.left - 2 * it.b.width() } ?: Int.MAX_VALUE
-                      val hi = dateW?.b?.left ?: Int.MAX_VALUE
-                      val nach = words.filter {
-                          it.b.centerX() in lo..hi && abs(it.cy - p.cy) < win && it.t.any { c -> c.isLetter() }
-                      }.sortedBy { it.b.left }.joinToString(" ") { it.t }.trim()
-          
-                      raw.add(R(name, num, dayW?.t?.toInt() ?: 0, nach, date))
+                      val dayW = near { it.b.left > p.b.right && dayRx.matches(it.t) && it.t.toInt() in 1..31 }
+                      val dateW = near { it.b.left > p.b.right && dateFind.containsMatchIn(fixDate(it.t)) }
+                      tmp.add(T(num, p, name, dayW, dateW))
                   }
-                  // if a meeting day could not be read for a row, use the most common one on the sheet
-                  val mode = raw.map { it.day }.filter { it > 0 }.groupingBy { it }.eachCount()
-                      .maxByOrNull { it.value }?.key ?: 0
-                  return raw.map { Client(it.name, it.phone, if (it.day > 0) it.day else mode, it.nach, it.last) }
+          
+                  // NACH column = between the meeting-day column and the last-paid column (same x range for all rows)
+                  val dayRights = tmp.mapNotNull { it.dayW?.b?.right }.sorted()
+                  val dateLefts = tmp.mapNotNull { it.dateW?.b?.left }.sorted()
+                  val nachLo = if (dayRights.isNotEmpty()) dayRights[dayRights.size / 2] else Int.MAX_VALUE
+                  val nachHi = if (dateLefts.isNotEmpty()) dateLefts[dateLefts.size / 10] else Int.MAX_VALUE
+          
+                  // the meeting day is normally the same for the whole sheet: if 80%+ agree, use it for every row
+                  val days = tmp.map { it.dayW?.t?.toInt() ?: 0 }
+                  val counts = days.filter { it > 0 }.groupingBy { it }.eachCount()
+                  val top = counts.maxByOrNull { it.value }
+                  val mode = top?.key ?: 0
+                  val unify = top != null && top.value >= 0.8 * counts.values.sum()
+          
+                  return tmp.mapIndexed { i, r ->
+                      val nach = words.filter {
+                          it.b.centerX() in nachLo..nachHi && abs(it.cy - ey(r.p, it)) < win && it.t.any { c -> c.isLetter() }
+                      }.sortedBy { it.b.left }.joinToString(" ") { it.t }.trim()
+                      val last = r.dateW?.let { dateFind.find(fixDate(it.t))!!.value } ?: ""
+                      Client(r.name, r.num, if (unify || days[i] == 0) mode else days[i], nach, last)
+                  }
               }
           }
           EOF_FILE
