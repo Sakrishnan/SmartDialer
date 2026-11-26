@@ -67,6 +67,7 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.CALL_PHONE" />
               <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.READ_CALL_LOG" />
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
               <uses-permission android:name="android.permission.CAMERA" />
               <uses-feature android:name="android.hardware.telephony" android:required="false" />
@@ -298,7 +299,13 @@ jobs:
           import android.content.Intent
           import android.graphics.Color
           import android.graphics.PixelFormat
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Handler
           import android.os.IBinder
+          import android.os.Looper
+          import android.provider.CallLog
+          import android.telecom.TelecomManager
           import android.telephony.PhoneStateListener
           import android.telephony.TelephonyManager
           import android.view.Gravity
@@ -314,7 +321,13 @@ jobs:
               private var wm: WindowManager? = null
               private var tm: TelephonyManager? = null
               private var listener: PhoneStateListener? = null
+              private val handler = Handler(Looper.getMainLooper())
+              private var statusTv: TextView? = null
+              private var client: Client? = null
               private var sawOffhook = false
+              private var total = 1
+              private var attemptNo = 1
+              private val waitSeconds = 30   // pause between redial attempts
           
               override fun onBind(i: Intent?): IBinder? = null
           
@@ -324,8 +337,13 @@ jobs:
                       i.getStringExtra("name") ?: "", i.getStringExtra("phone") ?: "",
                       i.getIntExtra("day", 0), i.getStringExtra("nach") ?: "", i.getStringExtra("last") ?: ""
                   )
+                  handler.removeCallbacksAndMessages(null)
+                  client = c
+                  total = i.getIntExtra("attempts", 1).coerceAtLeast(1)
+                  attemptNo = 1
+                  sawOffhook = false
                   show(c)
-                  listenForCallEnd()
+                  if (listener == null) listenForCallEnd()
                   return START_NOT_STICKY
               }
           
@@ -346,7 +364,14 @@ jobs:
                   box.addView(tv("NACH: ${c.nach}", 16f))
                   box.addView(tv("Last paid on: ${c.lastPaid}", 16f))
                   if (late) box.addView(tv("DELAYED PAYMENT", 18f, true))
-                  box.addView(Button(this).apply { text = "Hide"; setOnClickListener { stopSelf() } })
+                  if (total > 1) {
+                      statusTv = tv("Attempt 1 of $total", 16f, true)
+                      box.addView(statusTv)
+                  } else statusTv = null
+                  box.addView(Button(this).apply {
+                      text = if (total > 1) "Stop redial" else "Hide"
+                      setOnClickListener { stopSelf() }
+                  })
                   val lp = WindowManager.LayoutParams(
                       WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT,
                       WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -363,16 +388,84 @@ jobs:
                   listener = object : PhoneStateListener() {
                       override fun onCallStateChanged(state: Int, number: String?) {
                           if (state == TelephonyManager.CALL_STATE_OFFHOOK) sawOffhook = true
-                          if (state == TelephonyManager.CALL_STATE_IDLE && sawOffhook) stopSelf()
+                          if (state == TelephonyManager.CALL_STATE_IDLE && sawOffhook) {
+                              sawOffhook = false
+                              onCallEnded()
+                          }
                       }
                   }
                   tm!!.listen(listener, PhoneStateListener.LISTEN_CALL_STATE)
               }
           
+              private fun onCallEnded() {
+                  if (total <= 1) { stopSelf(); return }
+                  // give Android a moment to write the call to the call log, then see how long it lasted
+                  handler.postDelayed({ checkAndMaybeRedial() }, 3000)
+              }
+          
+              private fun checkAndMaybeRedial() {
+                  val c = client ?: return
+                  val duration = lastOutgoingDuration(c.phone)
+                  when {
+                      duration == null || duration > 0 -> stopSelf()          // answered (or cannot tell): stop
+                      attemptNo >= total -> {                                  // last attempt, still no answer
+                          statusTv?.text = "No answer after $total attempts"
+                          handler.postDelayed({ stopSelf() }, 6000)
+                      }
+                      else -> startCountdown(waitSeconds)
+                  }
+              }
+          
+              /** Duration in seconds of the most recent outgoing call to [phone]; 0 = nobody answered. null = unknown. */
+              private fun lastOutgoingDuration(phone: String): Int? {
+                  return try {
+                      contentResolver.query(
+                          CallLog.Calls.CONTENT_URI,
+                          arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.DURATION, CallLog.Calls.TYPE),
+                          null, null, CallLog.Calls.DATE + " DESC"
+                      )?.use { cur ->
+                          if (cur.moveToFirst()) {
+                              val num = (cur.getString(0) ?: "").filter { it.isDigit() }
+                              val dur = cur.getInt(1)
+                              val type = cur.getInt(2)
+                              if (type == CallLog.Calls.OUTGOING_TYPE && num.endsWith(phone.takeLast(10))) dur else null
+                          } else null
+                      }
+                  } catch (e: Exception) { null }
+              }
+          
+              private fun startCountdown(sec: Int) {
+                  var left = sec
+                  val r = object : Runnable {
+                      override fun run() {
+                          if (left > 0) {
+                              statusTv?.text = "No answer. Redialing in ${left}s (attempt ${attemptNo + 1} of $total)"
+                              left--
+                              handler.postDelayed(this, 1000)
+                          } else redial()
+                      }
+                  }
+                  handler.post(r)
+              }
+          
+              private fun redial() {
+                  val c = client ?: return
+                  attemptNo++
+                  statusTv?.text = "Calling... attempt $attemptNo of $total"
+                  sawOffhook = false
+                  try {
+                      (getSystemService(TELECOM_SERVICE) as TelecomManager).placeCall(Uri.parse("tel:${c.phone}"), Bundle())
+                  } catch (e: Exception) {
+                      stopSelf()
+                  }
+              }
+          
               private fun removeView() { view?.let { try { wm?.removeView(it) } catch (_: Exception) {} }; view = null }
           
               override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
                   listener?.let { tm?.listen(it, PhoneStateListener.LISTEN_NONE) }
+                  listener = null
                   removeView()
                   super.onDestroy()
               }
@@ -389,6 +482,8 @@ jobs:
           import android.net.Uri
           import android.os.Bundle
           import android.provider.Settings
+          import android.text.InputType
+          import android.view.Gravity
           import android.widget.*
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.appcompat.app.AppCompatActivity
@@ -401,6 +496,7 @@ jobs:
           
           class MainActivity : AppCompatActivity() {
               private lateinit var listBox: LinearLayout
+              private lateinit var attemptsEt: EditText
               private var photoUri: Uri? = null
               private var pending: Client? = null
               private var clients = listOf<Client>()
@@ -413,6 +509,7 @@ jobs:
           
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
+                  title = "Smart Dialer v6"
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 24, 24, 24) }
                   val bar = LinearLayout(this)
                   bar.addView(Button(this).apply {
@@ -430,6 +527,25 @@ jobs:
                       setOnClickListener { pickPic.launch("image/*") }
                   })
                   root.addView(bar)
+                  val attemptRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(8, 16, 8, 8)
+                  }
+                  attemptRow.addView(TextView(this).apply {
+                      text = "Call attempts (1 = no redial)"
+                      textSize = 15f
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+                  })
+                  attemptsEt = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      setText("1")
+                      setSelectAllOnFocus(true)
+                      gravity = Gravity.CENTER
+                      minEms = 3
+                  }
+                  attemptRow.addView(attemptsEt)
+                  root.addView(attemptRow)
                   listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                   root.addView(ScrollView(this).apply { addView(listBox) })
                   setContentView(root)
@@ -471,13 +587,16 @@ jobs:
                       startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
                       return
                   }
-                  val need = arrayOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE)
+                  val attempts = (attemptsEt.text.toString().toIntOrNull() ?: 1).coerceIn(1, 20)
+                  val wanted = mutableListOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE)
+                  if (attempts > 1) wanted.add(Manifest.permission.READ_CALL_LOG)
+                  val need = wanted
                       .filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
                   if (need.isNotEmpty()) { perms.launch(need.toTypedArray()); return }
                   pending = null
                   startService(Intent(this, OverlayService::class.java)
                       .putExtra("name", c.name).putExtra("phone", c.phone).putExtra("day", c.meetingDay)
-                      .putExtra("nach", c.nach).putExtra("last", c.lastPaid))
+                      .putExtra("nach", c.nach).putExtra("last", c.lastPaid).putExtra("attempts", attempts))
                   startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:${c.phone}")))
               }
           }
